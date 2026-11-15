@@ -156,7 +156,41 @@ module.exports = async (req, res) => {
     // accept unsigned only when ALLOW_UNSIGNED=1 (local testing).
     const sig = req.headers["x-agent-games-signature"];
     if (process.env.ALLOW_UNSIGNED !== "1") {
-      if (!sigOk(secret, sig, raw)) return send(401, { error: "bad_signature" }, null);
+      if (!sigOk(secret, sig, raw)) {
+                // TEMP DIAGNOSTIC (remove after preflight passes): identify whether the
+                // stored secret's generation or the signing scheme is the mismatch.
+                try {
+                            const envAsIs = process.env.AGENT_HMAC_SECRET || ""
+                            const envTrim = envAsIs.trim();
+                            const keyCands = {
+                                          parsed: secret,
+                                          utf8_trim: Buffer.from(envTrim, "utf8"),
+                                          utf8_raw: Buffer.from(envAsIs, "utf8"),
+                                          sha256_of_parsed: secret ? crypto.createHash("sha256").update(secret).digest() : null,
+                            };
+                            const gotNorm = String(sig || "").trim().replace(/^sha256=/i, "");
+                            const gotLow = gotNorm.toLowerCase();
+                            let match = "none";
+                            const candFp = {};
+                            for (const [name, key] of Object.entries(keyCands)) {
+                                          if (!key) continue;
+                                          const hex = crypto.createHmac("sha256", key).update(raw).digest("hex");
+                                          const b64 = crypto.createHmac("sha256", key).update(raw).digest("base64");
+                                          candFp[name] = hex.slice(0, 12);
+                                          if (gotLow === hex) match = name + ":hex";
+                                          else if (gotNorm === b64) match = name + ":base64";
+                            }
+                            console.log("SIGFAIL " + JSON.stringify({
+                                          got: String(sig || ""), bodyLen: raw.length,
+                                          body: raw.toString("utf8").slice(0, 400),
+                                          hdrs: Object.keys(req.headers || {}),
+                                          envLen: envTrim.length, envIs64Hex: /^[0-9a-fA-F]{64}$/.test(envTrim),
+                                          fp: secret ? crypto.createHash("sha256").update(secret).digest("hex").slice(0, 10) : null,
+                                          match, candFp,
+                            }));
+                } catch (e) { console.log("SIGFAIL debug error", String(e)); }
+                return send(401, { error: "bad_signature" }, null);
+      }
     }
 
     let task;
