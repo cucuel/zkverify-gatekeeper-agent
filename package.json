@@ -1,0 +1,10 @@
+{
+  "name": "zkverify-gatekeeper-agent",
+  "version": "1.0.0",
+  "description": "Proof Gatekeeper agent for zkVerify Agent Games Season 01",
+  "dependencies": {
+    "snarkjs": "^0.7.6"
+  },
+  "private": true,
+  "type": "commonjs"
+}

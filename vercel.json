@@ -1,0 +1,1 @@
+{"functions":{"api/index.js":{"includeFiles":"{gatekeeper.wasm,gatekeeper_final.zkey,circuits/**}","maxDuration":60,"memory":1024}},"rewrites":[{"destination":"/api/index.js","source":"/(.*)"}]}
