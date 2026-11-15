@@ -142,7 +142,7 @@ module.exports = async (req, res) => {
   };
   try {
     if (req.method === "GET") {
-      return send(200, { status: "ok", agent: "proof-gatekeeper", ts: Date.now() }, null);
+      return send(200, { ok: true, protocolVersion: "v1" }, secretBytes());
     }
     if (req.method !== "POST") return send(405, { error: "method_not_allowed" }, null);
 
@@ -166,7 +166,7 @@ module.exports = async (req, res) => {
 
     if (!task || typeof task !== "object" || !task.input || !task.task_id) {
       // Health / preflight style ping without a task payload.
-      return send(200, { status: "ok" }, secret);
+      return send(200, { ok: true, protocolVersion: "v1" }, secret);
     }
 
     const mode = task.mode === "practice" ? "practice" : "competition";
