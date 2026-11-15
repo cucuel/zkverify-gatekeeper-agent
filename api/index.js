@@ -11,6 +11,9 @@ const FR = 218882428718392752222464057452572750885483644004160343436982041865758
 
 // ---------- config ----------
 function secretBytes() {
+  // The platform signs with the secret string's own UTF-8 bytes (proven by
+  // the 2026-11-15 SIGFAIL diagnostic: match "utf8_raw:hex"). Do NOT
+  // hex-decode the 64-char secret into 32 bytes; that was the 401 cause.
   const raw = (process.env.AGENT_HMAC_SECRET || "").trim();
   if (!raw) return null;
   return Buffer.from(raw, "utf8");
@@ -38,12 +41,19 @@ function circuitPaths() {
 }
 
 // ---------- tiny KV (Upstash REST if configured, else in-memory) ----------
+// The Vercel Marketplace Upstash integration provisions KV_REST_API_URL /
+// KV_REST_API_TOKEN (not the UPSTASH_REDIS_REST_* names); accept either pair.
+function kvConfig() {
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const tok = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  return url && tok ? { url, tok } : null;
+}
 const mem = new Map();
 async function kvGet(key) {
-  const url = process.env.UPSTASH_REDIS_REST_URL, tok = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (url && tok) {
+  const cfg = kvConfig();
+  if (cfg) {
     try {
-      const r = await fetch(`${url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${tok}` } });
+      const r = await fetch(`${cfg.url}/get/${encodeURIComponent(key)}`, { headers: { Authorization: `Bearer ${cfg.tok}` } });
       const j = await r.json();
       return j.result ?? null;
     } catch (e) { /* fall through to memory */ }
@@ -52,12 +62,39 @@ async function kvGet(key) {
 }
 async function kvSet(key, val) {
   mem.set(key, val);
-  const url = process.env.UPSTASH_REDIS_REST_URL, tok = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (url && tok) {
+  const cfg = kvConfig();
+  if (cfg) {
     try {
-      await fetch(`${url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}`, { headers: { Authorization: `Bearer ${tok}` } });
+      await fetch(`${cfg.url}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}`, { headers: { Authorization: `Bearer ${cfg.tok}` } });
     } catch (e) { /* memory copy already kept */ }
   }
+}
+
+// ---------- durable task journal ----------
+// Vercel's dashboard logs retain only about an hour (proven 2026-11-16:
+// the whole Round 3 window had expired out of the logs view before it
+// could be audited). Every scored task is therefore journaled to the
+// durable KV as a list entry: gk:journal:<mode>, newest first, capped
+// at 1000. Fail-open by design: journaling is awaited before the
+// response (a serverless function may freeze after responding), but
+// any error or slowness is swallowed and never blocks or changes an
+// answer.
+async function kvJournal(entry) {
+  const cfg = kvConfig();
+  if (!cfg) return;
+  try {
+    const key = `gk:journal:${entry.mode}`;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 1500);
+    try {
+      await fetch(`${cfg.url}/pipeline`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${cfg.tok}`, "Content-Type": "application/json" },
+        body: JSON.stringify([["LPUSH", key, JSON.stringify(entry)], ["LTRIM", key, 0, 999]]),
+        signal: ctl.signal,
+      });
+    } finally { clearTimeout(timer); }
+  } catch (e) { /* fail-open */ }
 }
 
 // ---------- helpers ----------
@@ -140,6 +177,7 @@ module.exports = async (req, res) => {
     res.writeHead(code, headers);
     res.end(body);
   };
+  let parsedTask = null;
   try {
     if (req.method === "GET") {
       return send(200, { ok: true, protocolVersion: "v1" }, secretBytes());
@@ -155,7 +193,7 @@ module.exports = async (req, res) => {
     // accept unsigned only when ALLOW_UNSIGNED=1 (local testing).
     const sig = req.headers["x-agent-games-signature"];
     if (process.env.ALLOW_UNSIGNED !== "1") {
-      if (!sigOk(secret, sig, raw))         return send(401, { error: "bad_signature" }, null);
+      if (!sigOk(secret, sig, raw)) return send(401, { error: "bad_signature" }, null);
     }
 
     let task;
@@ -163,9 +201,13 @@ module.exports = async (req, res) => {
     catch (e) { return send(400, { error: "bad_json" }, secret); }
 
     console.log("TASK", JSON.stringify(task).slice(0, 2000));
+    parsedTask = task;
+    const t0 = Date.now();
 
     if (!task || typeof task !== "object" || !task.input || !task.task_id) {
-      // Health / preflight style ping without a task payload.
+      // Preflight / health ping: the platform requires signed protocol-v1
+      // JSON, exactly {"ok":true,"protocolVersion":"v1"} (per the platform's
+      // own preflight error text, 2026-11-15).
       return send(200, { ok: true, protocolVersion: "v1" }, secret);
     }
 
@@ -173,6 +215,9 @@ module.exports = async (req, res) => {
     const respKey = `gk:resp:${mode}:${task.task_id}`;
     const cached = await kvGet(respKey);
     if (cached) {
+      let cDec = null, cRsn = null;
+      try { const c = JSON.parse(cached); cDec = c.decision || null; cRsn = c.reason_code || null; } catch (e) {}
+      await kvJournal({ ts: new Date().toISOString(), task_id: String(task.task_id), mode, decision: cDec, reason: cRsn, proof: false, ms: Date.now() - t0, replay: true });
       const body = Buffer.from(cached, "utf8");
       const headers = { "Content-Type": "application/json" };
       if (secret) headers["x-agent-games-signature"] = hmacHex(secret, body);
@@ -221,6 +266,7 @@ module.exports = async (req, res) => {
     if (proofTx) await kvSet(seenKey, String(task.task_id));
     const bodyStr = JSON.stringify(out);
     await kvSet(respKey, bodyStr);
+    await kvJournal({ ts: new Date().toISOString(), task_id: String(task.task_id), mode, decision: out.decision, reason: out.reason_code, proof: !!out.proof, ms: Date.now() - t0, replay: false });
     const body = Buffer.from(bodyStr, "utf8");
     const headers = { "Content-Type": "application/json" };
     if (secret) headers["x-agent-games-signature"] = hmacHex(secret, body);
@@ -228,6 +274,9 @@ module.exports = async (req, res) => {
     return res.end(body);
   } catch (e) {
     console.log("HANDLER_ERROR", e && e.stack ? e.stack.split("\n").slice(0, 3).join(" | ") : String(e));
+    if (parsedTask && parsedTask.task_id) {
+      await kvJournal({ ts: new Date().toISOString(), task_id: String(parsedTask.task_id), mode: parsedTask.mode === "practice" ? "practice" : "competition", decision: "REJECT", reason: "INTERNAL_ERROR", proof: false, ms: null, replay: false });
+    }
     // Fail closed: still answer so the platform does not record a timeout.
     try { return send(200, { decision: "REJECT", reason_code: "INTERNAL_ERROR" }, secretBytes()); }
     catch (e2) { res.writeHead(500); return res.end("{}"); }
