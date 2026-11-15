@@ -33,3 +33,5 @@ approval.
 - `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` — optional durable
   store for the proof-reference seen-set and idempotent responses
   (in-memory fallback when unset)
+
+<!-- redeploy: pick up rotated secret -->
